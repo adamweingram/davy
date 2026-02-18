@@ -75,16 +75,18 @@ RUN set -eux; \
 
 # Agent CLIs
 RUN npm install -g --no-fund --no-audit \
-      @openai/codex \
-      @anthropic-ai/claude-code \
-      @google/gemini-cli \
-      @mariozechner/pi-coding-agent \
- && npm cache clean --force
+    @openai/codex \
+    @google/gemini-cli \
+    @mariozechner/pi-coding-agent \
+    && npm cache clean --force
 
 # Workspace
-RUN mkdir -p "${PROJECT_DIR}" \
- && chown -R "${USER_UID}:${USER_GID}" "${PROJECT_DIR}"
+RUN mkdir -p "${PROJECT_DIR}" && chown -R "${USER_UID}:${USER_GID}" "${PROJECT_DIR}"
 
 USER "${USERNAME}"
+
+# MUST happen after switching user
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
 WORKDIR "${PROJECT_DIR}"
 CMD ["bash"]
