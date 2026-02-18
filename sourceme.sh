@@ -31,6 +31,9 @@ Options:
       --keep            Do not --rm (container persists after exit)
   -e, --env KEY=VAL     Add an env var to the container (repeatable)
       --pass-env KEY    Forward an existing host env var by name (repeatable)
+      --auth-pi         Mount host PI agent auth into container
+      --auth-codex      Mount host Codex auth into container
+      --auth-gemini     Mount host Gemini auth into container
   -h, --help            Show this help
 
 Examples:
@@ -58,12 +61,12 @@ EOF
         fi
         shift 2
         ;;
+      --auth-pi|--pi-auth) EXTRA_ARGS+=("-v" "${HOME}/.pi/agent:/home/dev/.pi/agent"); shift ;;
+      --auth-codex|--codex-auth) EXTRA_ARGS+=("-v" "${HOME}/.codex:/home/dev/.codex" "-e" "CODEX_HOME=/home/dev/.codex"); shift ;;
+      --auth-gemini|--gemini-auth) EXTRA_ARGS+=("-v" "${HOME}/.gemini:/home/dev/.gemini"); shift ;;
       -h|--help) _devbox_help; return 0 ;;
       --) shift; CMD=("$@"); break ;;
       *) EXTRA_ARGS+=("$1"); shift ;;
-      --pi-auth) EXTRA_ARGS+=("-v" "${HOME}/.pi/agent:/home/dev/.pi/agent"); shift ;;
-      --codex-auth) EXTRA_ARGS+=("-v" "${HOME}/.codex:/home/dev/.codex" "-e" "CODEX_HOME=/home/dev/.codex"); shift ;;
-      --gemini-auth) EXTRA_ARGS+=("-v" "${HOME}/.gemini:/home/dev/.gemini"); shift ;;
     esac
   done
 
