@@ -11,6 +11,9 @@ devbox() {
   local NO_BUILD=0
   local KEEP=0
   local WITH_DOCKER_SOCK=0
+  local WITH_PI_AUTH=0
+  local WITH_CODEX_AUTH=0
+  local WITH_GEMINI_AUTH=0
   local WITH_CLAUDE_AUTH=0
   local HOST_UID HOST_GID
   HOST_UID="$(id -u)"
@@ -52,6 +55,7 @@ Options:
       --auth-codex      Mount host Codex auth into container
       --auth-gemini     Mount host Gemini auth into container
       --auth-claude     Mount persistent Claude auth volume into container
+      --auth-all        Enable --auth-pi --auth-codex --auth-gemini --auth-claude
   -h, --help            Show this help
 
 Auth management:
@@ -63,6 +67,7 @@ Examples:
   devbox
   devbox --docker
   devbox --auth-claude
+  devbox --auth-all
   devbox -p ~/code/myproj --rebuild
   devbox -e OPENAI_API_KEY="$OPENAI_API_KEY" --pass-env ANTHROPIC_API_KEY
   devbox -- npm test
@@ -85,15 +90,27 @@ EOF
         fi
         shift 2
         ;;
-      --auth-pi|--pi-auth) EXTRA_ARGS+=("-v" "${HOME}/.pi/agent:/home/dev/.pi/agent"); shift ;;
-      --auth-codex|--codex-auth) EXTRA_ARGS+=("-v" "${HOME}/.codex:/home/dev/.codex" "-e" "CODEX_HOME=/home/dev/.codex"); shift ;;
-      --auth-gemini|--gemini-auth) EXTRA_ARGS+=("-v" "${HOME}/.gemini:/home/dev/.gemini"); shift ;;
+      --auth-pi|--pi-auth) WITH_PI_AUTH=1; shift ;;
+      --auth-codex|--codex-auth) WITH_CODEX_AUTH=1; shift ;;
+      --auth-gemini|--gemini-auth) WITH_GEMINI_AUTH=1; shift ;;
       --auth-claude|--claude-auth) WITH_CLAUDE_AUTH=1; shift ;;
+      --auth-all) WITH_PI_AUTH=1; WITH_CODEX_AUTH=1; WITH_GEMINI_AUTH=1; WITH_CLAUDE_AUTH=1; shift ;;
       -h|--help) _devbox_help; return 0 ;;
       --) shift; CMD=("$@"); break ;;
       *) EXTRA_ARGS+=("$1"); shift ;;
     esac
   done
+
+  if [ "$WITH_PI_AUTH" -eq 1 ]; then
+    EXTRA_ARGS+=("-v" "${HOME}/.pi/agent:/home/dev/.pi/agent")
+  fi
+  if [ "$WITH_CODEX_AUTH" -eq 1 ]; then
+    EXTRA_ARGS+=("-v" "${HOME}/.codex:/home/dev/.codex")
+    EXTRA_ENVS+=("-e" "CODEX_HOME=/home/dev/.codex")
+  fi
+  if [ "$WITH_GEMINI_AUTH" -eq 1 ]; then
+    EXTRA_ARGS+=("-v" "${HOME}/.gemini:/home/dev/.gemini")
+  fi
 
   # Validate paths
   if [ ! -f "$DOCKERFILE" ]; then

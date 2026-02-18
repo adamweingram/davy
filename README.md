@@ -19,3 +19,6 @@ devbox auth claude reset
 ```
 
 Volume name defaults to `devbox-claude-auth-<uid>-v1` and can be overridden with `DEVBOX_CLAUDE_AUTH_VOLUME`.
+
+## All auths at once
+Use `--auth-all` to enable auth setup for Pi, Codex, Gemini, and Claude in one command.
