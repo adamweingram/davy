@@ -21,11 +21,11 @@ RUN set -eux; \
     dnf -y swap --allowerasing curl-minimal curl; \
     \
     dnf -y install \
-      bash git openssh-clients \
-      sudo zsh tmux \
-      gcc gcc-c++ make pkgconf-pkg-config \
-      python3 python3-pip \
-      jq less unzip zip xz tar gzip findutils which; \
+    bash git openssh-clients \
+    sudo zsh tmux \
+    gcc gcc-c++ make pkgconf-pkg-config \
+    python3 python3-pip \
+    jq less unzip zip xz tar gzip findutils which; \
     \
     # Enable CRB + EPEL for ripgrep/fd-find
     dnf config-manager --set-enabled crb; \
@@ -34,7 +34,7 @@ RUN set -eux; \
     \
     # Ensure `fd` exists (some distros call it fdfind)
     if ! command -v fd >/dev/null 2>&1 && command -v fdfind >/dev/null 2>&1; then \
-      ln -sf "$(command -v fdfind)" /usr/local/bin/fd; \
+    ln -sf "$(command -v fdfind)" /usr/local/bin/fd; \
     fi; \
     \
     # Docker CLI (useful if you mount /var/run/docker.sock)
@@ -48,12 +48,12 @@ RUN set -eux; \
 RUN set -eux; \
     distro="${NODE_DISTRO:-}"; \
     if [ -z "$distro" ]; then \
-      arch="$(uname -m)"; \
-      case "$arch" in \
-        x86_64|amd64) distro="linux-x64" ;; \
-        aarch64|arm64) distro="linux-arm64" ;; \
-        *) echo "Unsupported arch: ${arch}. Set NODE_DISTRO explicitly (linux-x64/linux-arm64)." >&2; exit 1 ;; \
-      esac; \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+    x86_64|amd64) distro="linux-x64" ;; \
+    aarch64|arm64) distro="linux-arm64" ;; \
+    *) echo "Unsupported arch: ${arch}. Set NODE_DISTRO explicitly (linux-x64/linux-arm64)." >&2; exit 1 ;; \
+    esac; \
     fi; \
     cd /tmp; \
     curl -fsSLO "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-${distro}.tar.xz"; \
@@ -67,7 +67,7 @@ RUN set -eux; \
 # Non-root user (matches host UID/GID for mounted volumes)
 RUN set -eux; \
     if ! getent group "${USER_GID}" >/dev/null; then \
-      groupadd --gid "${USER_GID}" "${USERNAME}"; \
+    groupadd --gid "${USER_GID}" "${USERNAME}"; \
     fi; \
     useradd --uid "${USER_UID}" --gid "${USER_GID}" -m -s /bin/bash "${USERNAME}"; \
     echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USERNAME}"; \
