@@ -87,7 +87,8 @@ EOF
     GID_ARG="$(id -g)"
 
     if [ "$REBUILD" -eq 1 ]; then
-      DOCKER_BUILDKIT=1 docker build --pull \
+      # Use `DOCKER_BUILDKIT=1` if you want to use buildkit
+      docker build --pull \
         --build-arg USER_UID="$UID_ARG" \
         --build-arg USER_GID="$GID_ARG" \
         -f "$DOCKERFILE" -t "$IMAGE" "$CONTEXT_DIR" || return 1
