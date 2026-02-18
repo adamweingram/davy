@@ -121,8 +121,6 @@ EOF
   RUN_ARGS+=(--name "$NAME")
   RUN_ARGS+=(-v "${PROJECT_DIR}:/project" -w /project)
 
-  RUN_ARGS+=(-v "${HOME}/.pi/agent:/home/dev/.pi/agent")  # Make sure we give pi access to oauth tokens, etc.
-
   if [ "$WITH_DOCKER_SOCK" -eq 1 ]; then
     RUN_ARGS+=(-v /var/run/docker.sock:/var/run/docker.sock)
   fi
