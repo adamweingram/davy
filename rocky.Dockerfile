@@ -9,8 +9,8 @@ ARG NODE_VERSION=25.6.1
 ARG NODE_DISTRO=""
 ARG TARGETARCH
 
-ENV PROJECT_DIR=/project \
-    PATH=/home/${USERNAME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV PROJECT_DIR=/project
+ENV PATH=/home/${USERNAME}/.cargo/bin:/home/${USERNAME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Base tooling + repos + Docker CLI
 RUN set -eux; \
@@ -87,6 +87,11 @@ USER "${USERNAME}"
 
 # MUST happen after switching user
 RUN curl -fsSL https://claude.ai/install.sh | bash
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y && echo '. "$HOME/.cargo/env"' >> ~/.bashrc
+RUN cargo install --locked hyperfine && \
+    cargo install --locked hexyl && \
+    cargo install --locked bat
 
 WORKDIR "${PROJECT_DIR}"
 CMD ["bash"]
