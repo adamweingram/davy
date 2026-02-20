@@ -11,6 +11,9 @@ devbox() {
   local NO_BUILD=0
   local KEEP=0
   local WITH_DOCKER_SOCK=0
+  local WITH_EXPOSE_SSH=0
+  local SSH_PORT=222
+  local SSH_AUTH_KEYS_B64=""
   local WITH_PI_AUTH=0
   local WITH_CODEX_AUTH=0
   local WITH_GEMINI_AUTH=0
@@ -56,6 +59,11 @@ Options:
       --auth-gemini     Mount host Gemini auth into container
       --auth-claude     Mount persistent Claude auth volume into container
       --auth-all        Enable --auth-pi --auth-codex --auth-gemini --auth-claude
+  -s, --expose-ssh [PORT]
+                      Publish host PORT to container port 22 (default: 222)
+                      Login user: dev (public key auth only)
+                      Keys source: ~/.ssh/authorized_keys + ~/.ssh/*.pub
+                      Override with DEVBOX_SSH_AUTHORIZED_KEYS_FILE=/path/to/file
   -h, --help            Show this help
 
 Auth management:
@@ -83,6 +91,20 @@ EOF
       --rebuild) REBUILD=1; shift ;;
       --no-build) NO_BUILD=1; shift ;;
       --keep) KEEP=1; shift ;;
+      -s|--expose-ssh)
+        WITH_EXPOSE_SSH=1
+        if [ $# -gt 1 ] && [ -n "$2" ] && [ "${2#-}" = "$2" ]; then
+          SSH_PORT="$2"
+          shift 2
+        else
+          shift
+        fi
+        ;;
+      --expose-ssh=*)
+        WITH_EXPOSE_SSH=1
+        SSH_PORT="${1#*=}"
+        shift
+        ;;
       -e|--env) EXTRA_ENVS+=("-e" "$2"); shift 2 ;;
       --pass-env)
         if [ -n "$2" ]; then
@@ -100,6 +122,19 @@ EOF
       *) EXTRA_ARGS+=("$1"); shift ;;
     esac
   done
+
+  if [ "$WITH_EXPOSE_SSH" -eq 1 ]; then
+    case "$SSH_PORT" in
+      ''|*[!0-9]*)
+        echo "devbox: invalid SSH port '$SSH_PORT' (expected 1-65535)" >&2
+        return 1
+        ;;
+    esac
+    if [ "$SSH_PORT" -lt 1 ] || [ "$SSH_PORT" -gt 65535 ]; then
+      echo "devbox: invalid SSH port '$SSH_PORT' (expected 1-65535)" >&2
+      return 1
+    fi
+  fi
 
   if [ "$WITH_PI_AUTH" -eq 1 ]; then
     EXTRA_ARGS+=("-v" "${HOME}/.pi/agent:/home/dev/.pi/agent")
@@ -155,6 +190,43 @@ EOF
       bash -lc "mkdir -p /auth/.claude && touch /auth/.claude.json && chown -R ${HOST_UID}:${HOST_GID} /auth" >/dev/null || return 1
   fi
 
+  if [ "$WITH_EXPOSE_SSH" -eq 1 ]; then
+    local pub
+    local SSH_AUTH_KEYS_CONTENT=""
+
+    if [ -n "${DEVBOX_SSH_AUTHORIZED_KEYS_FILE:-}" ]; then
+      if [ ! -f "${DEVBOX_SSH_AUTHORIZED_KEYS_FILE}" ]; then
+        echo "devbox: DEVBOX_SSH_AUTHORIZED_KEYS_FILE not found: ${DEVBOX_SSH_AUTHORIZED_KEYS_FILE}" >&2
+        return 1
+      fi
+      SSH_AUTH_KEYS_CONTENT="$(awk 'NF && !seen[$0]++' "${DEVBOX_SSH_AUTHORIZED_KEYS_FILE}")"
+    else
+      SSH_AUTH_KEYS_CONTENT="$({
+        if [ -f "${HOME}/.ssh/authorized_keys" ]; then
+          cat "${HOME}/.ssh/authorized_keys"
+        fi
+        for pub in "${HOME}"/.ssh/*.pub; do
+          if [ -f "$pub" ]; then
+            cat "$pub"
+          fi
+        done
+      } | awk 'NF && !seen[$0]++')"
+    fi
+
+    if [ -z "$SSH_AUTH_KEYS_CONTENT" ]; then
+      echo "devbox: no SSH public keys found. Add ~/.ssh/*.pub or set DEVBOX_SSH_AUTHORIZED_KEYS_FILE." >&2
+      return 1
+    fi
+
+    SSH_AUTH_KEYS_B64="$(printf '%s\n' "$SSH_AUTH_KEYS_CONTENT" | base64 | tr -d '\n')"
+    if [ -z "$SSH_AUTH_KEYS_B64" ]; then
+      echo "devbox: failed to encode SSH authorized_keys content." >&2
+      return 1
+    fi
+
+    EXTRA_ENVS+=("-e" "DEVBOX_SSH_AUTH_KEYS_B64=${SSH_AUTH_KEYS_B64}")
+  fi
+
   # Name default
   if [ -z "$NAME" ]; then
     local base ts
@@ -179,6 +251,9 @@ EOF
 
   if [ "$WITH_DOCKER_SOCK" -eq 1 ]; then
     RUN_ARGS+=(-v /var/run/docker.sock:/var/run/docker.sock)
+  fi
+  if [ "$WITH_EXPOSE_SSH" -eq 1 ]; then
+    RUN_ARGS+=(-p "${SSH_PORT}:22")
   fi
 
   # Start shell if no command provided
@@ -212,14 +287,69 @@ exec "$@"'
     )
   fi
 
+  if [ "$WITH_EXPOSE_SSH" -eq 1 ]; then
+    local -a ORIGINAL_CMD
+    ORIGINAL_CMD=("${CMD[@]}")
+    CMD=(
+      bash -lc
+      'set -e
+if ! command -v sshd >/dev/null 2>&1; then
+  echo "devbox: sshd is not installed in image. Rebuild with the latest rocky.Dockerfile." >&2
+  exit 1
+fi
+
+if [ -z "${DEVBOX_SSH_AUTH_KEYS_B64:-}" ]; then
+  echo "devbox: DEVBOX_SSH_AUTH_KEYS_B64 is missing." >&2
+  exit 1
+fi
+
+mkdir -p /home/dev/.ssh
+chmod 700 /home/dev/.ssh
+if ! printf "%s" "$DEVBOX_SSH_AUTH_KEYS_B64" | base64 -d >/home/dev/.ssh/authorized_keys 2>/dev/null; then
+  printf "%s" "$DEVBOX_SSH_AUTH_KEYS_B64" | base64 --decode >/home/dev/.ssh/authorized_keys
+fi
+if [ ! -s /home/dev/.ssh/authorized_keys ]; then
+  echo "devbox: decoded authorized_keys is empty." >&2
+  exit 1
+fi
+chmod 600 /home/dev/.ssh/authorized_keys
+
+sudo mkdir -p /run/sshd
+if ! ls /etc/ssh/ssh_host_*_key >/dev/null 2>&1; then
+  sudo ssh-keygen -A >/dev/null
+fi
+
+sudo /usr/sbin/sshd \
+  -o PermitRootLogin=no \
+  -o PasswordAuthentication=no \
+  -o KbdInteractiveAuthentication=no \
+  -o ChallengeResponseAuthentication=no \
+  -o PubkeyAuthentication=yes \
+  -o AuthorizedKeysFile=.ssh/authorized_keys \
+  -o PidFile=/tmp/devbox-sshd.pid
+
+exec "$@"'
+      --
+      "${ORIGINAL_CMD[@]}"
+    )
+  fi
+
   # Security reminder when enabling docker socket
   if [ "$WITH_DOCKER_SOCK" -eq 1 ]; then
     echo "devbox: docker socket mounted. Container can control host Docker." >&2
+  fi
+  if [ "$WITH_EXPOSE_SSH" -eq 1 ]; then
+    echo "devbox: exposing host port ${SSH_PORT} to container port 22." >&2
+    echo "devbox: SSH login user is 'dev' (key auth only)." >&2
   fi
   if [ "$WITH_CLAUDE_AUTH" -eq 1 ]; then
     echo "devbox: Claude auth volume mounted at /home/dev/.claude-auth (${CLAUDE_AUTH_VOLUME})." >&2
     echo "devbox: first use requires running 'claude login' in-container." >&2
   fi
 
+  local run_status
   docker run "${RUN_ARGS[@]}" "${EXTRA_ENVS[@]}" "${EXTRA_ARGS[@]}" "$IMAGE" "${CMD[@]}"
+  run_status=$?
+
+  return "$run_status"
 }

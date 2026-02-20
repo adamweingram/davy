@@ -21,7 +21,7 @@ RUN set -eux; \
     dnf -y swap --allowerasing curl-minimal curl; \
     \
     dnf -y install \
-    bash git openssh-clients \
+    bash git openssh-clients openssh-server wget \
     sudo zsh tmux \
     gcc gcc-c++ make pkgconf-pkg-config \
     python3 python3-pip \
