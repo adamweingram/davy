@@ -1,3 +1,774 @@
+use std::collections::HashSet;
+use std::env;
+use std::ffi::OsString;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
+
+use anyhow::{Context, Result, bail};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use chrono::Local;
+use clap::{ArgAction, Args, Parser, Subcommand};
+use users::{get_current_gid, get_current_uid};
+
+const DEFAULT_IMAGE: &str = "davy-sandbox:latest";
+const CLAUDE_LINK_SCRIPT: &str = r#"set -e
+mkdir -p /home/dev/.claude-auth/.claude
+touch /home/dev/.claude-auth/.claude.json
+
+if [ -e /home/dev/.claude ] && [ ! -L /home/dev/.claude ]; then
+  rm -rf /home/dev/.claude
+fi
+if [ -e /home/dev/.claude.json ] && [ ! -L /home/dev/.claude.json ]; then
+  rm -f /home/dev/.claude.json
+fi
+
+ln -sfn /home/dev/.claude-auth/.claude /home/dev/.claude
+ln -sfn /home/dev/.claude-auth/.claude.json /home/dev/.claude.json
+export CLAUDE_CONFIG_DIR=/home/dev/.claude
+
+exec "$@""#;
+
+const SSH_BOOTSTRAP_SCRIPT: &str = r#"set -e
+if ! command -v sshd >/dev/null 2>&1; then
+  echo "davy: sshd is not installed in image. Rebuild with the latest rocky.Dockerfile." >&2
+  exit 1
+fi
+
+if ! command -v ps >/dev/null 2>&1; then
+  echo "davy: 'ps' is required for remote IDE SSH helpers (VS Code and derivatives)." >&2
+  echo "davy: rebuild with the latest rocky.Dockerfile." >&2
+  exit 1
+fi
+
+if ! command -v flock >/dev/null 2>&1; then
+  echo "davy: 'flock' is required for remote IDE SSH helpers (VS Code and derivatives)." >&2
+  echo "davy: rebuild with the latest rocky.Dockerfile." >&2
+  exit 1
+fi
+
+if [ -z "${DAVY_SSH_AUTH_KEYS_B64:-}" ]; then
+  echo "davy: DAVY_SSH_AUTH_KEYS_B64 is missing." >&2
+  exit 1
+fi
+
+mkdir -p /home/dev/.ssh
+chmod 700 /home/dev/.ssh
+if ! printf "%s" "$DAVY_SSH_AUTH_KEYS_B64" | base64 -d >/home/dev/.ssh/authorized_keys 2>/dev/null; then
+  printf "%s" "$DAVY_SSH_AUTH_KEYS_B64" | base64 --decode >/home/dev/.ssh/authorized_keys
+fi
+if [ ! -s /home/dev/.ssh/authorized_keys ]; then
+  echo "davy: decoded authorized_keys is empty." >&2
+  exit 1
+fi
+chmod 600 /home/dev/.ssh/authorized_keys
+
+sudo mkdir -p /run/sshd
+if ! ls /etc/ssh/ssh_host_*_key >/dev/null 2>&1; then
+  sudo ssh-keygen -A >/dev/null
+fi
+
+sudo /usr/sbin/sshd \
+  -o PermitRootLogin=no \
+  -o PasswordAuthentication=no \
+  -o KbdInteractiveAuthentication=no \
+  -o ChallengeResponseAuthentication=no \
+  -o PubkeyAuthentication=yes \
+  -o AuthorizedKeysFile=.ssh/authorized_keys \
+  -o PidFile=/tmp/davy-sshd.pid
+
+exec "$@""#;
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "davy",
+    about = "Docker-based sandbox runner for agent CLIs",
+    version,
+    args_conflicts_with_subcommands = true
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    #[command(flatten)]
+    run: RunArgs,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Manage persistent auth state
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthCommands {
+    /// Claude auth volume management
+    Claude {
+        #[command(subcommand)]
+        command: ClaudeCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ClaudeCommands {
+    /// Delete the Claude auth volume
+    Reset,
+}
+
+#[derive(Debug, Args)]
+struct RunArgs {
+    /// Mount project directory at /project
+    #[arg(short = 'p', long = "project", value_name = "DIR")]
+    project_dir: Option<PathBuf>,
+
+    /// Container name
+    #[arg(short = 'n', long = "name", value_name = "NAME")]
+    name: Option<String>,
+
+    /// Also mount host docker socket
+    #[arg(long = "docker", action = ArgAction::SetTrue)]
+    with_docker_sock: bool,
+
+    /// Force rebuild of the image before running
+    #[arg(long = "rebuild", action = ArgAction::SetTrue)]
+    rebuild: bool,
+
+    /// Do not build; fail if image is missing
+    #[arg(long = "no-build", action = ArgAction::SetTrue)]
+    no_build: bool,
+
+    /// Do not remove the container on exit
+    #[arg(long = "keep", action = ArgAction::SetTrue)]
+    keep: bool,
+
+    /// Publish host PORT to container port 22 (default: 222)
+    #[arg(
+        short = 's',
+        long = "expose-ssh",
+        num_args = 0..=1,
+        default_missing_value = "222",
+        value_name = "PORT",
+        value_parser = clap::value_parser!(u16).range(1..)
+    )]
+    expose_ssh: Option<u16>,
+
+    /// Additional environment variable in KEY=VALUE format (repeatable)
+    #[arg(short = 'e', long = "env", value_name = "KEY=VALUE", action = ArgAction::Append)]
+    extra_env: Vec<String>,
+
+    /// Forward host environment variable by key name (repeatable)
+    #[arg(long = "pass-env", value_name = "KEY", action = ArgAction::Append)]
+    pass_env: Vec<String>,
+
+    /// Mount host Pi auth
+    #[arg(long = "auth-pi", alias = "pi-auth", action = ArgAction::SetTrue)]
+    with_pi_auth: bool,
+
+    /// Mount host Codex auth
+    #[arg(long = "auth-codex", alias = "codex-auth", action = ArgAction::SetTrue)]
+    with_codex_auth: bool,
+
+    /// Mount host Gemini auth
+    #[arg(long = "auth-gemini", alias = "gemini-auth", action = ArgAction::SetTrue)]
+    with_gemini_auth: bool,
+
+    /// Mount persistent Claude auth volume
+    #[arg(long = "auth-claude", alias = "claude-auth", action = ArgAction::SetTrue)]
+    with_claude_auth: bool,
+
+    /// Enable all auth mounts (pi, codex, gemini, claude)
+    #[arg(short = 'a', long = "auth-all", action = ArgAction::SetTrue)]
+    auth_all: bool,
+
+    /// Docker image tag
+    #[arg(long = "image", env = "DAVY_IMAGE", default_value = DEFAULT_IMAGE)]
+    image: String,
+
+    /// Dockerfile to build (defaults to ./rocky.Dockerfile, then ./debian.Dockerfile)
+    #[arg(long = "dockerfile", env = "DAVY_DOCKERFILE", value_name = "PATH")]
+    dockerfile: Option<PathBuf>,
+
+    /// Additional docker run arguments (pass before --)
+    #[arg(
+        value_name = "DOCKER_ARG",
+        allow_hyphen_values = true,
+        value_terminator = "--"
+    )]
+    extra_docker_args: Vec<OsString>,
+
+    /// Command to run inside the container (pass after --)
+    #[arg(trailing_var_arg = true, value_name = "COMMAND")]
+    cmd: Vec<OsString>,
+}
+
+struct RuntimeSettings {
+    project_dir: PathBuf,
+    dockerfile: PathBuf,
+    context_dir: PathBuf,
+    image: String,
+    name: String,
+    host_uid: u32,
+    host_gid: u32,
+    keep: bool,
+    rebuild: bool,
+    no_build: bool,
+    with_docker_sock: bool,
+    expose_ssh: Option<u16>,
+    with_claude_auth: bool,
+    claude_auth_volume: String,
+    extra_docker_args: Vec<OsString>,
+    extra_env_args: Vec<OsString>,
+    cmd: Vec<OsString>,
+}
+
 fn main() {
-    println!("Hello, world!");
+    if let Err(err) = try_main() {
+        eprintln!("davy: {err:#}");
+        std::process::exit(1);
+    }
+}
+
+fn try_main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Commands::Auth {
+            command:
+                AuthCommands::Claude {
+                    command: ClaudeCommands::Reset,
+                },
+        }) => reset_claude_auth_volume(),
+        None => run_container(cli.run),
+    }
+}
+
+fn run_container(args: RunArgs) -> Result<()> {
+    let mut settings = build_runtime_settings(args)?;
+
+    maybe_build_image(&settings)?;
+
+    if settings.with_claude_auth {
+        ensure_claude_volume_ready(&settings)?;
+    }
+
+    if settings.expose_ssh.is_some() {
+        let ssh_auth_content = collect_ssh_authorized_keys()?;
+        let encoded = STANDARD.encode(ssh_auth_content);
+        push_env(
+            &mut settings.extra_env_args,
+            format!("DAVY_SSH_AUTH_KEYS_B64={encoded}"),
+        );
+    }
+
+    if settings.cmd.is_empty() {
+        settings.cmd.push(OsString::from("bash"));
+    }
+
+    if settings.with_claude_auth {
+        settings.cmd = wrap_bash_script(CLAUDE_LINK_SCRIPT, std::mem::take(&mut settings.cmd));
+    }
+    if settings.expose_ssh.is_some() {
+        settings.cmd = wrap_bash_script(SSH_BOOTSTRAP_SCRIPT, std::mem::take(&mut settings.cmd));
+    }
+
+    if settings.with_docker_sock {
+        eprintln!("davy: docker socket mounted. Container can control host Docker.");
+    }
+    if let Some(port) = settings.expose_ssh {
+        eprintln!("davy: exposing host port {port} to container port 22.");
+        eprintln!("davy: SSH login user is 'dev' (key auth only).");
+    }
+    if settings.with_claude_auth {
+        eprintln!(
+            "davy: Claude auth volume mounted at /home/dev/.claude-auth ({}).",
+            settings.claude_auth_volume
+        );
+        eprintln!("davy: first use requires running 'claude login' in-container.");
+    }
+
+    let status = docker_run(&settings)?;
+    if status.success() {
+        return Ok(());
+    }
+
+    match status.code() {
+        Some(code) => std::process::exit(code),
+        None => bail!("docker run terminated by signal"),
+    }
+}
+
+fn build_runtime_settings(args: RunArgs) -> Result<RuntimeSettings> {
+    let host_uid = get_current_uid();
+    let host_gid = get_current_gid();
+
+    let project_dir = match args.project_dir {
+        Some(path) => path,
+        None => env::current_dir().context("failed to read current directory")?,
+    };
+    if !project_dir.is_dir() {
+        bail!("project dir not found: {}", project_dir.display());
+    }
+
+    let dockerfile = resolve_dockerfile(args.dockerfile)?;
+    if !dockerfile.is_file() {
+        bail!("Dockerfile not found at: {}", dockerfile.display());
+    }
+
+    let context_dir = dockerfile
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let mut with_pi_auth = args.with_pi_auth;
+    let mut with_codex_auth = args.with_codex_auth;
+    let mut with_gemini_auth = args.with_gemini_auth;
+    let mut with_claude_auth = args.with_claude_auth;
+    if args.auth_all {
+        with_pi_auth = true;
+        with_codex_auth = true;
+        with_gemini_auth = true;
+        with_claude_auth = true;
+    }
+
+    let claude_auth_volume = env::var("DAVY_CLAUDE_AUTH_VOLUME")
+        .unwrap_or_else(|_| format!("davy-claude-auth-{host_uid}-v1"));
+
+    let mut extra_env_args = Vec::new();
+    for kv in args.extra_env {
+        push_env(&mut extra_env_args, kv);
+    }
+    for key in args.pass_env {
+        let value = env::var(&key).unwrap_or_default();
+        push_env(&mut extra_env_args, format!("{key}={value}"));
+    }
+
+    let mut extra_docker_args = args.extra_docker_args;
+    if with_pi_auth {
+        push_volume(
+            &mut extra_docker_args,
+            format!("{}/.pi/agent:/home/dev/.pi/agent", home_dir()?.display()),
+        );
+    }
+    if with_codex_auth {
+        push_volume(
+            &mut extra_docker_args,
+            format!("{}/.codex:/home/dev/.codex", home_dir()?.display()),
+        );
+        push_env(
+            &mut extra_env_args,
+            "CODEX_HOME=/home/dev/.codex".to_owned(),
+        );
+    }
+    if with_gemini_auth {
+        push_volume(
+            &mut extra_docker_args,
+            format!("{}/.gemini:/home/dev/.gemini", home_dir()?.display()),
+        );
+    }
+    push_volume(
+        &mut extra_docker_args,
+        format!(
+            "{}/.agents/skills:/home/dev/.agents/skills",
+            home_dir()?.display()
+        ),
+    );
+
+    let name = args
+        .name
+        .unwrap_or_else(|| default_container_name(&project_dir));
+
+    Ok(RuntimeSettings {
+        project_dir,
+        dockerfile,
+        context_dir,
+        image: args.image,
+        name,
+        host_uid,
+        host_gid,
+        keep: args.keep,
+        rebuild: args.rebuild,
+        no_build: args.no_build,
+        with_docker_sock: args.with_docker_sock,
+        expose_ssh: args.expose_ssh,
+        with_claude_auth,
+        claude_auth_volume,
+        extra_docker_args,
+        extra_env_args,
+        cmd: args.cmd,
+    })
+}
+
+fn resolve_dockerfile(from_cli: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = from_cli {
+        return Ok(path);
+    }
+
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let rocky = cwd.join("rocky.Dockerfile");
+    if rocky.is_file() {
+        return Ok(rocky);
+    }
+
+    let debian = cwd.join("debian.Dockerfile");
+    if debian.is_file() {
+        return Ok(debian);
+    }
+
+    bail!(
+        "no Dockerfile found (looked for {} and {}); use --dockerfile or DAVY_DOCKERFILE",
+        rocky.display(),
+        debian.display()
+    );
+}
+
+fn default_container_name(project_dir: &Path) -> String {
+    let base = project_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "project".to_owned());
+
+    let timestamp = Local::now().format("%Y%m%d-%H%M%S");
+    format!("davy-{base}-{timestamp}")
+}
+
+fn maybe_build_image(settings: &RuntimeSettings) -> Result<()> {
+    if settings.no_build {
+        if docker_image_exists(&settings.image)? {
+            return Ok(());
+        }
+        bail!(
+            "image '{}' not found (and --no-build was set)",
+            settings.image
+        );
+    }
+
+    if settings.rebuild {
+        return docker_build(settings, true);
+    }
+
+    if !docker_image_exists(&settings.image)? {
+        return docker_build(settings, false);
+    }
+
+    Ok(())
+}
+
+fn docker_build(settings: &RuntimeSettings, pull: bool) -> Result<()> {
+    let mut cmd = Command::new("docker");
+    cmd.arg("build");
+    if pull {
+        cmd.arg("--pull");
+    }
+
+    cmd.arg("--build-arg")
+        .arg(format!("USER_UID={}", settings.host_uid))
+        .arg("--build-arg")
+        .arg(format!("USER_GID={}", settings.host_gid))
+        .arg("-f")
+        .arg(&settings.dockerfile)
+        .arg("-t")
+        .arg(&settings.image)
+        .arg(&settings.context_dir);
+
+    run_checked(&mut cmd, "docker build")
+}
+
+fn docker_image_exists(image: &str) -> Result<bool> {
+    let status = Command::new("docker")
+        .arg("image")
+        .arg("inspect")
+        .arg(image)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("failed to run docker image inspect")?;
+
+    Ok(status.success())
+}
+
+fn ensure_claude_volume_ready(settings: &RuntimeSettings) -> Result<()> {
+    let mut create_volume = Command::new("docker");
+    create_volume
+        .arg("volume")
+        .arg("create")
+        .arg(&settings.claude_auth_volume);
+    run_checked(&mut create_volume, "docker volume create")?;
+
+    let mut init_volume = Command::new("docker");
+    init_volume
+        .arg("run")
+        .arg("--rm")
+        .arg("--user")
+        .arg("0:0")
+        .arg("-v")
+        .arg(format!("{}:/auth", settings.claude_auth_volume))
+        .arg(&settings.image)
+        .arg("bash")
+        .arg("-lc")
+        .arg(format!(
+            "mkdir -p /auth/.claude && touch /auth/.claude.json && chown -R {}:{} /auth",
+            settings.host_uid, settings.host_gid
+        ));
+    run_checked(
+        &mut init_volume,
+        "docker run (initialize Claude auth volume)",
+    )
+}
+
+fn docker_run(settings: &RuntimeSettings) -> Result<ExitStatus> {
+    let mut cmd = Command::new("docker");
+    cmd.arg("run").arg("-it");
+
+    if !settings.keep {
+        cmd.arg("--rm");
+    }
+
+    cmd.arg("--name")
+        .arg(&settings.name)
+        .arg("-v")
+        .arg(format!("{}:/project", settings.project_dir.display()))
+        .arg("-w")
+        .arg("/project");
+
+    if settings.with_claude_auth {
+        cmd.arg("--mount").arg(format!(
+            "type=volume,src={},dst=/home/dev/.claude-auth",
+            settings.claude_auth_volume
+        ));
+    }
+
+    if settings.with_docker_sock {
+        cmd.arg("-v")
+            .arg("/var/run/docker.sock:/var/run/docker.sock");
+    }
+
+    if let Some(port) = settings.expose_ssh {
+        cmd.arg("-p").arg(format!("{port}:22"));
+    }
+
+    cmd.args(&settings.extra_env_args)
+        .args(&settings.extra_docker_args)
+        .arg(&settings.image)
+        .args(&settings.cmd);
+
+    cmd.status().context("failed to run docker run")
+}
+
+fn wrap_bash_script(script: &str, original_cmd: Vec<OsString>) -> Vec<OsString> {
+    let mut wrapped = vec![
+        OsString::from("bash"),
+        OsString::from("-lc"),
+        OsString::from(script),
+        OsString::from("--"),
+    ];
+    wrapped.extend(original_cmd);
+    wrapped
+}
+
+fn collect_ssh_authorized_keys() -> Result<String> {
+    let mut unique = HashSet::new();
+    let mut keys = Vec::new();
+
+    if let Ok(path) = env::var("DAVY_SSH_AUTHORIZED_KEYS_FILE") {
+        let key_path = PathBuf::from(&path);
+        if !key_path.is_file() {
+            bail!("DAVY_SSH_AUTHORIZED_KEYS_FILE not found: {path}");
+        }
+        collect_key_lines_from_file(&key_path, &mut unique, &mut keys)?;
+    } else {
+        let ssh_dir = home_dir()?.join(".ssh");
+        let authorized_keys = ssh_dir.join("authorized_keys");
+        if authorized_keys.is_file() {
+            collect_key_lines_from_file(&authorized_keys, &mut unique, &mut keys)?;
+        }
+
+        if ssh_dir.is_dir() {
+            let mut pubs = fs::read_dir(&ssh_dir)
+                .with_context(|| format!("failed to read {}", ssh_dir.display()))?
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .filter(|path| path.extension().is_some_and(|ext| ext == "pub"))
+                .collect::<Vec<_>>();
+            pubs.sort();
+
+            for path in pubs {
+                if path.is_file() {
+                    collect_key_lines_from_file(&path, &mut unique, &mut keys)?;
+                }
+            }
+        }
+    }
+
+    if keys.is_empty() {
+        bail!("no SSH public keys found. Add ~/.ssh/*.pub or set DAVY_SSH_AUTHORIZED_KEYS_FILE");
+    }
+
+    Ok(format!("{}\n", keys.join("\n")))
+}
+
+fn collect_key_lines_from_file(
+    path: &Path,
+    unique: &mut HashSet<String>,
+    output: &mut Vec<String>,
+) -> Result<()> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read SSH keys from {}", path.display()))?;
+
+    for line in content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if unique.insert(line.to_owned()) {
+            output.push(line.to_owned());
+        }
+    }
+
+    Ok(())
+}
+
+fn reset_claude_auth_volume() -> Result<()> {
+    let uid = get_current_uid();
+    let volume = env::var("DAVY_CLAUDE_AUTH_VOLUME")
+        .unwrap_or_else(|_| format!("davy-claude-auth-{uid}-v1"));
+
+    let exists = Command::new("docker")
+        .arg("volume")
+        .arg("inspect")
+        .arg(&volume)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("failed to run docker volume inspect")?
+        .success();
+
+    if exists {
+        let mut remove_volume = Command::new("docker");
+        remove_volume.arg("volume").arg("rm").arg("-f").arg(&volume);
+        run_checked(&mut remove_volume, "docker volume rm")?;
+        eprintln!("davy: removed Claude auth volume '{volume}'");
+    } else {
+        eprintln!("davy: Claude auth volume '{volume}' does not exist");
+    }
+
+    Ok(())
+}
+
+fn run_checked(cmd: &mut Command, name: &str) -> Result<()> {
+    let status = cmd
+        .status()
+        .with_context(|| format!("failed to run {name}"))?;
+    if status.success() {
+        return Ok(());
+    }
+
+    match status.code() {
+        Some(code) => bail!("{name} exited with status code {code}"),
+        None => bail!("{name} terminated by signal"),
+    }
+}
+
+fn home_dir() -> Result<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is not set")
+}
+
+fn push_env(args: &mut Vec<OsString>, value: impl Into<OsString>) {
+    args.push(OsString::from("-e"));
+    args.push(value.into());
+}
+
+fn push_volume(args: &mut Vec<OsString>, volume: impl Into<OsString>) {
+    args.push(OsString::from("-v"));
+    args.push(volume.into());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_name_has_prefix() {
+        let name = default_container_name(Path::new("/tmp/my-project"));
+        assert!(name.starts_with("davy-my-project-"));
+        assert_eq!(name.len(), "davy-my-project-YYYYMMDD-HHMMSS".len());
+    }
+
+    #[test]
+    fn wrap_script_prefixes_command() {
+        let wrapped = wrap_bash_script("echo hi", vec![OsString::from("bash")]);
+        let expected = vec![
+            OsString::from("bash"),
+            OsString::from("-lc"),
+            OsString::from("echo hi"),
+            OsString::from("--"),
+            OsString::from("bash"),
+        ];
+        assert_eq!(wrapped, expected);
+    }
+
+    #[test]
+    fn clap_parses_extra_docker_args_and_command() {
+        let cli = Cli::try_parse_from([
+            "davy",
+            "--name",
+            "my-name",
+            "--privileged",
+            "--",
+            "echo",
+            "ok",
+        ])
+        .expect("CLI should parse");
+
+        assert_eq!(cli.run.name.as_deref(), Some("my-name"));
+        assert_eq!(
+            cli.run.extra_docker_args,
+            vec![OsString::from("--privileged")]
+        );
+        assert_eq!(
+            cli.run.cmd,
+            vec![OsString::from("echo"), OsString::from("ok")]
+        );
+    }
+
+    #[test]
+    fn clap_expose_ssh_defaults_to_222() {
+        let cli = Cli::try_parse_from(["davy", "--expose-ssh"]).expect("CLI should parse");
+        assert_eq!(cli.run.expose_ssh, Some(222));
+    }
+
+    #[test]
+    fn clap_parses_passthrough_docker_args_without_command() {
+        let cli = Cli::try_parse_from(["davy", "--privileged", "--network", "host"])
+            .expect("CLI should parse");
+        assert_eq!(
+            cli.run.extra_docker_args,
+            vec![
+                OsString::from("--privileged"),
+                OsString::from("--network"),
+                OsString::from("host")
+            ]
+        );
+        assert!(cli.run.cmd.is_empty());
+    }
+
+    #[test]
+    fn clap_parses_auth_claude_reset_subcommand() {
+        let cli =
+            Cli::try_parse_from(["davy", "auth", "claude", "reset"]).expect("CLI should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Auth {
+                command: AuthCommands::Claude {
+                    command: ClaudeCommands::Reset
+                }
+            })
+        ));
+    }
 }

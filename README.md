@@ -1,44 +1,94 @@
-A simple Docker-based sandbox for running agents with a bash function interface.
+# davy
 
-## "Install"
-```zsh
-. /this/dir/sourceme.sh
-```
+A simple Docker-based sandbox runner for agent workflows. That's all. It just runs docker commands.
 
-## Claude auth (persistent, opt-in)
-Use `--auth-claude` to mount a persistent Docker volume for Claude login state:
+## Build and Run
 
 ```zsh
-devbox --auth-claude
+cargo run -- --help
 ```
 
-Reset that auth volume:
+Install as a local binary:
 
 ```zsh
-devbox auth claude reset
+cargo install --path .
 ```
 
-Volume name defaults to `devbox-claude-auth-<uid>-v1` and can be overridden with `DEVBOX_CLAUDE_AUTH_VOLUME`.
+The installed executable is `davy`.
 
-## All auths at once
-Use `--auth-all` to enable auth setup for Pi, Codex, Gemini, and Claude in one command.
-
-## SSH access
-Expose SSH on host port `222` (or pass a custom port):
+Optional compatibility mode (legacy shell script; you probably don't need it):
 
 ```zsh
-devbox --expose-ssh
-devbox --expose-ssh 2200
+. /path/to/davy/sourceme.sh
 ```
 
-Then connect:
+## Usage
 
 ```zsh
-ssh -p 222 dev@localhost
+davy [options] [extra docker args] [-- command...]
+davy auth claude reset
 ```
 
-Notes:
-- SSH login is user `dev`, key-only auth (password auth disabled).
-- Keys are populated from `~/.ssh/authorized_keys` and `~/.ssh/*.pub` on the host.
-- Set `DEVBOX_SSH_AUTHORIZED_KEYS_FILE=/path/to/authorized_keys` to override key source.
-- `~/.agents/skills` is mapped as a volume automatically (no matter if you use various `--auth-xxx` or not).
+Examples:
+
+```zsh
+# Interactive shell in /project
+# (builds image if needed)
+davy
+
+# Rebuild image first, then run
+davy --rebuild
+
+# Use a specific project directory
+davy -p ~/code/myproj
+
+# Pass env vars
+davy -e OPENAI_API_KEY="$OPENAI_API_KEY" --pass-env ANTHROPIC_API_KEY
+
+# Mount Docker socket
+davy --docker
+
+# Enable persistent Claude auth
+davy --auth-claude
+
+# Enable all auth mounts (Pi, Codex, Gemini, Claude)
+davy --auth-all
+
+# Expose SSH on default host port 222
+davy --expose-ssh
+
+# Expose SSH on custom port
+davy --expose-ssh 2200
+
+# Run a command instead of bash
+davy -- npm test
+
+# Reset Claude auth volume
+davy auth claude reset
+```
+
+## Dockerfile Resolution
+
+By default, `davy` looks for:
+1. `./rocky.Dockerfile`
+2. `./debian.Dockerfile`
+
+Override with:
+- `--dockerfile /path/to/Dockerfile`
+- `DAVY_DOCKERFILE=/path/to/Dockerfile`
+
+## Environment Variables
+
+- `DAVY_IMAGE` (default: `davy-sandbox:latest`)
+- `DAVY_DOCKERFILE` (optional Dockerfile path)
+- `DAVY_CLAUDE_AUTH_VOLUME` (default: `davy-claude-auth-<uid>-v1`)
+- `DAVY_SSH_AUTHORIZED_KEYS_FILE` (optional path to authorized keys source)
+
+## SSH Notes
+
+When `--expose-ssh` is enabled:
+- host port defaults to `222`
+- login user is `dev`
+- only public key auth is enabled
+- keys are sourced from `~/.ssh/authorized_keys` and `~/.ssh/*.pub` unless `DAVY_SSH_AUTHORIZED_KEYS_FILE` is set
+- `~/.agents/skills` is always mounted at `/home/dev/.agents/skills`
