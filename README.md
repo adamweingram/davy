@@ -41,4 +41,4 @@ Notes:
 - SSH login is user `dev`, key-only auth (password auth disabled).
 - Keys are populated from `~/.ssh/authorized_keys` and `~/.ssh/*.pub` on the host.
 - Set `DEVBOX_SSH_AUTHORIZED_KEYS_FILE=/path/to/authorized_keys` to override key source.
-- Rebuild once after pulling changes so `openssh-server` is present: `devbox --rebuild`.
+- `~/.agents/skills` is mapped as a volume automatically (no matter if you use various `--auth-xxx` or not).

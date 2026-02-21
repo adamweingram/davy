@@ -147,6 +147,8 @@ EOF
     EXTRA_ARGS+=("-v" "${HOME}/.gemini:/home/dev/.gemini")
   fi
 
+  EXTRA_ARGS+=("-v" "${HOME}/.agents/skills:/home/dev/.agents/skills")  # Load non-specific agent skills
+
   # Validate paths
   if [ ! -f "$DOCKERFILE" ]; then
     echo "devbox: Dockerfile not found at: $DOCKERFILE" >&2
@@ -295,6 +297,18 @@ exec "$@"'
       'set -e
 if ! command -v sshd >/dev/null 2>&1; then
   echo "devbox: sshd is not installed in image. Rebuild with the latest rocky.Dockerfile." >&2
+  exit 1
+fi
+
+if ! command -v ps >/dev/null 2>&1; then
+  echo "devbox: 'ps' is required for remote IDE SSH helpers (VS Code and derivatives)." >&2
+  echo "devbox: rebuild with the latest rocky.Dockerfile." >&2
+  exit 1
+fi
+
+if ! command -v flock >/dev/null 2>&1; then
+  echo "devbox: 'flock' is required for remote IDE SSH helpers (VS Code and derivatives)." >&2
+  echo "devbox: rebuild with the latest rocky.Dockerfile." >&2
   exit 1
 fi
 
