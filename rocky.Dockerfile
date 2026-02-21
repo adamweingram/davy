@@ -7,6 +7,7 @@ ARG USER_GID=${USER_UID}
 
 ARG NODE_VERSION=25.6.1
 ARG NODE_DISTRO=""
+# Docker/buildx sets TARGETARCH to values like amd64/arm64.
 ARG TARGETARCH
 
 ENV PROJECT_DIR=/project
@@ -48,7 +49,10 @@ RUN set -eux; \
 RUN set -eux; \
     distro="${NODE_DISTRO:-}"; \
     if [ -z "$distro" ]; then \
+    arch="${TARGETARCH:-}"; \
+    if [ -z "$arch" ]; then \
     arch="$(uname -m)"; \
+    fi; \
     case "$arch" in \
     x86_64|amd64) distro="linux-x64" ;; \
     aarch64|arm64) distro="linux-arm64" ;; \
