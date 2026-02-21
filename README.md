@@ -100,6 +100,9 @@ When `--expose-ssh` is enabled:
 ## Linux Notes
 
 - With `--docker`, `davy` resolves the host socket from `--docker-sock`, then `DAVY_DOCKER_SOCK`, then `DOCKER_HOST=unix://...`, then `/var/run/docker.sock`.
-- If `DOCKER_HOST` is set to a non-unix endpoint (for example `tcp://...`), `--docker` requires `--docker-sock` (or `DAVY_DOCKER_SOCK`) so a local socket can be mounted.
+  - If `DOCKER_HOST` is set to a non-unix endpoint (for example `tcp://...`), `--docker` requires `--docker-sock` (or `DAVY_DOCKER_SOCK`) so a local socket can be mounted. Alternatively, skip `--docker` entirely and forward the TCP endpoint directly into the container via `-e` and `--add-host`:
+    ```sh
+    davy -e DOCKER_HOST="tcp://host.docker.internal:2375" --add-host=host.docker.internal:host-gateway
+    ```
 - Auth directory mounts are validated before running. Explicit auth flags fail fast if host directories are missing; `--auth-all` skips missing auth directories with warnings.
 - The skills mount (`~/.agents/skills`) is mounted only when the host directory exists.
