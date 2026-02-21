@@ -196,9 +196,13 @@ struct RunArgs {
     #[arg(long = "image", env = "DAVY_IMAGE", default_value = DEFAULT_IMAGE)]
     image: String,
 
-    /// Dockerfile to build (defaults to ./rocky.Dockerfile, then ./debian.Dockerfile)
+    /// Dockerfile to build (defaults to ~/.config/davy/rocky.Dockerfile, then ~/.config/davy/debian.Dockerfile)
     #[arg(long = "dockerfile", env = "DAVY_DOCKERFILE", value_name = "PATH")]
     dockerfile: Option<PathBuf>,
+
+    /// Use Dockerfile from current directory instead of ~/.config/davy
+    #[arg(long = "local-dockerfile", action = ArgAction::SetTrue)]
+    local_dockerfile: bool,
 
     /// Additional docker run arguments (pass before --)
     #[arg(
@@ -328,7 +332,7 @@ fn build_runtime_settings(args: RunArgs) -> Result<RuntimeSettings> {
         bail!("project dir not found: {}", project_dir.display());
     }
 
-    let dockerfile = resolve_dockerfile(args.dockerfile)?;
+    let dockerfile = resolve_dockerfile(args.dockerfile, args.local_dockerfile)?;
     if !dockerfile.is_file() {
         bail!("Dockerfile not found at: {}", dockerfile.display());
     }
@@ -434,24 +438,40 @@ fn build_runtime_settings(args: RunArgs) -> Result<RuntimeSettings> {
     })
 }
 
-fn resolve_dockerfile(from_cli: Option<PathBuf>) -> Result<PathBuf> {
+fn resolve_dockerfile(from_cli: Option<PathBuf>, local: bool) -> Result<PathBuf> {
     if let Some(path) = from_cli {
         return Ok(path);
     }
 
-    let cwd = env::current_dir().context("failed to read current directory")?;
-    let rocky = cwd.join("rocky.Dockerfile");
+    if local {
+        let cwd = env::current_dir().context("failed to read current directory")?;
+        let rocky = cwd.join("rocky.Dockerfile");
+        if rocky.is_file() {
+            return Ok(rocky);
+        }
+        let debian = cwd.join("debian.Dockerfile");
+        if debian.is_file() {
+            return Ok(debian);
+        }
+        bail!(
+            "no Dockerfile found in current directory (looked for {} and {})",
+            rocky.display(),
+            debian.display()
+        );
+    }
+
+    let config_dir = home_dir()?.join(".config/davy");
+    let rocky = config_dir.join("rocky.Dockerfile");
     if rocky.is_file() {
         return Ok(rocky);
     }
-
-    let debian = cwd.join("debian.Dockerfile");
+    let debian = config_dir.join("debian.Dockerfile");
     if debian.is_file() {
         return Ok(debian);
     }
 
     bail!(
-        "no Dockerfile found (looked for {} and {}); use --dockerfile or DAVY_DOCKERFILE",
+        "no Dockerfile found (looked for {} and {}); use --dockerfile, --local-dockerfile, or DAVY_DOCKERFILE",
         rocky.display(),
         debian.display()
     );
@@ -935,5 +955,11 @@ mod tests {
             parse_unix_socket_from_docker_host("tcp://127.0.0.1:2375"),
             None
         );
+    }
+
+    #[test]
+    fn clap_parses_local_dockerfile_flag() {
+        let cli = Cli::try_parse_from(["davy", "--local-dockerfile"]).expect("CLI should parse");
+        assert!(cli.run.local_dockerfile);
     }
 }

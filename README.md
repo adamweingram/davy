@@ -73,10 +73,14 @@ davy auth claude reset
 ## Dockerfile Resolution
 
 By default, `davy` looks for:
+1. `~/.config/davy/rocky.Dockerfile`
+2. `~/.config/davy/debian.Dockerfile`
+
+Use `--local-dockerfile` to search the current directory instead:
 1. `./rocky.Dockerfile`
 2. `./debian.Dockerfile`
 
-Override with:
+Override with a specific path:
 - `--dockerfile /path/to/Dockerfile`
 - `DAVY_DOCKERFILE=/path/to/Dockerfile`
 
