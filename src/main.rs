@@ -10,7 +10,11 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use chrono::Local;
 use clap::{ArgAction, Args, Parser, Subcommand};
-use users::{get_current_gid, get_current_uid};
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+#[cfg(unix)]
+use users::os::unix::UserExt;
+use users::{get_current_gid, get_current_uid, get_user_by_uid};
 
 const DEFAULT_IMAGE: &str = "davy-sandbox:latest";
 const CLAUDE_LINK_SCRIPT: &str = r#"set -e
@@ -133,6 +137,10 @@ struct RunArgs {
     #[arg(long = "docker", action = ArgAction::SetTrue)]
     with_docker_sock: bool,
 
+    /// Docker socket path to mount (defaults to DAVY_DOCKER_SOCK, DOCKER_HOST unix://, then /var/run/docker.sock)
+    #[arg(long = "docker-sock", env = "DAVY_DOCKER_SOCK", value_name = "PATH")]
+    docker_sock: Option<PathBuf>,
+
     /// Force rebuild of the image before running
     #[arg(long = "rebuild", action = ArgAction::SetTrue)]
     rebuild: bool,
@@ -216,7 +224,8 @@ struct RuntimeSettings {
     keep: bool,
     rebuild: bool,
     no_build: bool,
-    with_docker_sock: bool,
+    docker_sock: Option<PathBuf>,
+    docker_sock_gid: Option<u32>,
     expose_ssh: Option<u16>,
     with_claude_auth: bool,
     claude_auth_volume: String,
@@ -275,8 +284,14 @@ fn run_container(args: RunArgs) -> Result<()> {
         settings.cmd = wrap_bash_script(SSH_BOOTSTRAP_SCRIPT, std::mem::take(&mut settings.cmd));
     }
 
-    if settings.with_docker_sock {
-        eprintln!("davy: docker socket mounted. Container can control host Docker.");
+    if let Some(docker_sock) = settings.docker_sock.as_ref() {
+        eprintln!(
+            "davy: docker socket mounted from {}. Container can control host Docker.",
+            docker_sock.display()
+        );
+        if let Some(gid) = settings.docker_sock_gid {
+            eprintln!("davy: adding supplementary group {gid} for docker socket access.");
+        }
     }
     if let Some(port) = settings.expose_ssh {
         eprintln!("davy: exposing host port {port} to container port 22.");
@@ -323,19 +338,16 @@ fn build_runtime_settings(args: RunArgs) -> Result<RuntimeSettings> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let mut with_pi_auth = args.with_pi_auth;
-    let mut with_codex_auth = args.with_codex_auth;
-    let mut with_gemini_auth = args.with_gemini_auth;
-    let mut with_claude_auth = args.with_claude_auth;
-    if args.auth_all {
-        with_pi_auth = true;
-        with_codex_auth = true;
-        with_gemini_auth = true;
-        with_claude_auth = true;
-    }
+    let with_pi_auth = args.with_pi_auth || args.auth_all;
+    let with_codex_auth = args.with_codex_auth || args.auth_all;
+    let with_gemini_auth = args.with_gemini_auth || args.auth_all;
+    let with_claude_auth = args.with_claude_auth || args.auth_all;
+    let allow_missing_auth = args.auth_all;
 
     let claude_auth_volume = env::var("DAVY_CLAUDE_AUTH_VOLUME")
         .unwrap_or_else(|_| format!("davy-claude-auth-{host_uid}-v1"));
+
+    let home = home_dir()?;
 
     let mut extra_env_args = Vec::new();
     for kv in args.extra_env {
@@ -348,34 +360,53 @@ fn build_runtime_settings(args: RunArgs) -> Result<RuntimeSettings> {
 
     let mut extra_docker_args = args.extra_docker_args;
     if with_pi_auth {
-        push_volume(
+        add_bind_mount(
             &mut extra_docker_args,
-            format!("{}/.pi/agent:/home/dev/.pi/agent", home_dir()?.display()),
-        );
+            &home.join(".pi/agent"),
+            "/home/dev/.pi/agent",
+            "Pi auth",
+            allow_missing_auth,
+        )?;
     }
     if with_codex_auth {
-        push_volume(
+        if add_bind_mount(
             &mut extra_docker_args,
-            format!("{}/.codex:/home/dev/.codex", home_dir()?.display()),
-        );
-        push_env(
-            &mut extra_env_args,
-            "CODEX_HOME=/home/dev/.codex".to_owned(),
-        );
+            &home.join(".codex"),
+            "/home/dev/.codex",
+            "Codex auth",
+            allow_missing_auth,
+        )? {
+            push_env(
+                &mut extra_env_args,
+                "CODEX_HOME=/home/dev/.codex".to_owned(),
+            );
+        }
     }
     if with_gemini_auth {
-        push_volume(
+        add_bind_mount(
             &mut extra_docker_args,
-            format!("{}/.gemini:/home/dev/.gemini", home_dir()?.display()),
-        );
+            &home.join(".gemini"),
+            "/home/dev/.gemini",
+            "Gemini auth",
+            allow_missing_auth,
+        )?;
     }
-    push_volume(
+    if !add_bind_mount(
         &mut extra_docker_args,
-        format!(
-            "{}/.agents/skills:/home/dev/.agents/skills",
-            home_dir()?.display()
-        ),
-    );
+        &home.join(".agents/skills"),
+        "/home/dev/.agents/skills",
+        "agents skills",
+        true,
+    )? {
+        eprintln!("davy: warning: continuing without host skills mount.");
+    }
+
+    let docker_sock = if args.with_docker_sock {
+        Some(resolve_docker_socket_path(args.docker_sock)?)
+    } else {
+        None
+    };
+    let docker_sock_gid = docker_sock_gid(docker_sock.as_deref())?;
 
     let name = args
         .name
@@ -392,7 +423,8 @@ fn build_runtime_settings(args: RunArgs) -> Result<RuntimeSettings> {
         keep: args.keep,
         rebuild: args.rebuild,
         no_build: args.no_build,
-        with_docker_sock: args.with_docker_sock,
+        docker_sock,
+        docker_sock_gid,
         expose_ssh: args.expose_ssh,
         with_claude_auth,
         claude_auth_volume,
@@ -542,9 +574,12 @@ fn docker_run(settings: &RuntimeSettings) -> Result<ExitStatus> {
         ));
     }
 
-    if settings.with_docker_sock {
+    if let Some(docker_sock) = settings.docker_sock.as_ref() {
         cmd.arg("-v")
-            .arg("/var/run/docker.sock:/var/run/docker.sock");
+            .arg(format!("{}:/var/run/docker.sock", docker_sock.display()));
+        if let Some(gid) = settings.docker_sock_gid {
+            cmd.arg("--group-add").arg(gid.to_string());
+        }
     }
 
     if let Some(port) = settings.expose_ssh {
@@ -673,9 +708,117 @@ fn run_checked(cmd: &mut Command, name: &str) -> Result<()> {
 }
 
 fn home_dir() -> Result<PathBuf> {
-    env::var_os("HOME")
+    if let Some(home) = env::var_os("HOME") {
+        return Ok(PathBuf::from(home));
+    }
+
+    #[cfg(unix)]
+    {
+        return get_user_by_uid(get_current_uid())
+            .map(|user| user.home_dir().to_path_buf())
+            .context("HOME is not set and current user home directory could not be resolved");
+    }
+
+    #[cfg(not(unix))]
+    {
+        bail!("HOME is not set");
+    }
+}
+
+fn add_bind_mount(
+    args: &mut Vec<OsString>,
+    source: &Path,
+    target: &str,
+    label: &str,
+    allow_missing: bool,
+) -> Result<bool> {
+    if source.is_dir() {
+        push_volume(args, format!("{}:{target}", source.display()));
+        return Ok(true);
+    }
+
+    if source.exists() {
+        bail!(
+            "{label} mount source is not a directory: {}",
+            source.display()
+        );
+    }
+
+    if allow_missing {
+        eprintln!(
+            "davy: warning: {label} mount source not found at {}; skipping.",
+            source.display()
+        );
+        return Ok(false);
+    }
+
+    bail!("{label} mount source not found: {}", source.display());
+}
+
+fn resolve_docker_socket_path(from_cli: Option<PathBuf>) -> Result<PathBuf> {
+    let socket = if let Some(path) = from_cli {
+        path
+    } else if let Some(path) = env::var("DOCKER_HOST")
+        .ok()
+        .as_deref()
+        .and_then(parse_unix_socket_from_docker_host)
+    {
+        path
+    } else if let Ok(host) = env::var("DOCKER_HOST") {
+        bail!(
+            "DOCKER_HOST is set to '{host}', but --docker needs a local unix socket. Set --docker-sock or DAVY_DOCKER_SOCK."
+        );
+    } else {
+        PathBuf::from("/var/run/docker.sock")
+    };
+
+    let metadata = fs::metadata(&socket)
+        .with_context(|| format!("docker socket not found: {}", socket.display()))?;
+    #[cfg(unix)]
+    {
+        if !metadata.file_type().is_socket() {
+            bail!(
+                "docker socket path is not a unix socket: {}",
+                socket.display()
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+    }
+
+    Ok(socket)
+}
+
+fn parse_unix_socket_from_docker_host(docker_host: &str) -> Option<PathBuf> {
+    docker_host
+        .strip_prefix("unix://")
+        .filter(|path| !path.is_empty())
         .map(PathBuf::from)
-        .context("HOME is not set")
+}
+
+fn docker_sock_gid(path: Option<&Path>) -> Result<Option<u32>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+
+    #[cfg(unix)]
+    {
+        let metadata = fs::metadata(path).with_context(|| {
+            format!(
+                "failed to read metadata for docker socket at {}",
+                path.display()
+            )
+        })?;
+        Ok(Some(metadata.gid()))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(None)
+    }
 }
 
 fn push_env(args: &mut Vec<OsString>, value: impl Into<OsString>) {
@@ -770,5 +913,27 @@ mod tests {
                 }
             })
         ));
+    }
+
+    #[test]
+    fn clap_parses_docker_sock_path() {
+        let cli = Cli::try_parse_from(["davy", "--docker", "--docker-sock", "/tmp/docker.sock"])
+            .expect("CLI should parse");
+        assert!(cli.run.with_docker_sock);
+        assert_eq!(cli.run.docker_sock, Some(PathBuf::from("/tmp/docker.sock")));
+    }
+
+    #[test]
+    fn parse_unix_docker_host_extracts_socket_path() {
+        let socket = parse_unix_socket_from_docker_host("unix:///run/user/1000/docker.sock");
+        assert_eq!(socket, Some(PathBuf::from("/run/user/1000/docker.sock")));
+    }
+
+    #[test]
+    fn parse_non_unix_docker_host_returns_none() {
+        assert_eq!(
+            parse_unix_socket_from_docker_host("tcp://127.0.0.1:2375"),
+            None
+        );
     }
 }

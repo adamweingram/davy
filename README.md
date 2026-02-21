@@ -48,6 +48,9 @@ davy -e OPENAI_API_KEY="$OPENAI_API_KEY" --pass-env ANTHROPIC_API_KEY
 # Mount Docker socket
 davy --docker
 
+# Mount a specific Docker socket path (useful on Linux rootless Docker)
+davy --docker --docker-sock /run/user/1000/docker.sock
+
 # Enable persistent Claude auth
 davy --auth-claude
 
@@ -81,6 +84,7 @@ Override with:
 
 - `DAVY_IMAGE` (default: `davy-sandbox:latest`)
 - `DAVY_DOCKERFILE` (optional Dockerfile path)
+- `DAVY_DOCKER_SOCK` (optional Docker socket path for `--docker`)
 - `DAVY_CLAUDE_AUTH_VOLUME` (default: `davy-claude-auth-<uid>-v1`)
 - `DAVY_SSH_AUTHORIZED_KEYS_FILE` (optional path to authorized keys source)
 
@@ -91,4 +95,11 @@ When `--expose-ssh` is enabled:
 - login user is `dev`
 - only public key auth is enabled
 - keys are sourced from `~/.ssh/authorized_keys` and `~/.ssh/*.pub` unless `DAVY_SSH_AUTHORIZED_KEYS_FILE` is set
-- `~/.agents/skills` is always mounted at `/home/dev/.agents/skills`
+- if present, `~/.agents/skills` is mounted at `/home/dev/.agents/skills`
+
+## Linux Notes
+
+- With `--docker`, `davy` resolves the host socket from `--docker-sock`, then `DAVY_DOCKER_SOCK`, then `DOCKER_HOST=unix://...`, then `/var/run/docker.sock`.
+- If `DOCKER_HOST` is set to a non-unix endpoint (for example `tcp://...`), `--docker` requires `--docker-sock` (or `DAVY_DOCKER_SOCK`) so a local socket can be mounted.
+- Auth directory mounts are validated before running. Explicit auth flags fail fast if host directories are missing; `--auth-all` skips missing auth directories with warnings.
+- The skills mount (`~/.agents/skills`) is mounted only when the host directory exists.
