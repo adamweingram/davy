@@ -24,7 +24,7 @@ RUN set -eux; \
     dnf -y install \
     bash git openssh-clients openssh-server procps-ng util-linux wget \
     sudo zsh tmux \
-    gcc gcc-c++ make pkgconf-pkg-config \
+    gcc gcc-c++ make pkgconf-pkg-config libatomic \
     python3 python3-pip \
     jq less unzip zip xz tar gzip findutils which; \
     \
