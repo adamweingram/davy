@@ -36,7 +36,7 @@ Examples:
 # (builds image if needed)
 davy
 
-# Rebuild image first, then run
+# Rebuild image first (pull base + no cache), then run
 davy --rebuild
 
 # Use a specific project directory

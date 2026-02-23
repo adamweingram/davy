@@ -141,7 +141,7 @@ struct RunArgs {
     #[arg(long = "docker-sock", env = "DAVY_DOCKER_SOCK", value_name = "PATH")]
     docker_sock: Option<PathBuf>,
 
-    /// Force rebuild of the image before running
+    /// Force rebuild of the image before running (pull + no cache)
     #[arg(long = "rebuild", action = ArgAction::SetTrue)]
     rebuild: bool,
 
@@ -500,21 +500,24 @@ fn maybe_build_image(settings: &RuntimeSettings) -> Result<()> {
     }
 
     if settings.rebuild {
-        return docker_build(settings, true);
+        return docker_build(settings, true, true);
     }
 
     if !docker_image_exists(&settings.image)? {
-        return docker_build(settings, false);
+        return docker_build(settings, false, false);
     }
 
     Ok(())
 }
 
-fn docker_build(settings: &RuntimeSettings, pull: bool) -> Result<()> {
+fn docker_build(settings: &RuntimeSettings, pull: bool, no_cache: bool) -> Result<()> {
     let mut cmd = Command::new("docker");
     cmd.arg("build");
     if pull {
         cmd.arg("--pull");
+    }
+    if no_cache {
+        cmd.arg("--no-cache");
     }
 
     cmd.arg("--build-arg")
