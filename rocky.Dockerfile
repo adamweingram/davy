@@ -11,7 +11,8 @@ ARG NODE_DISTRO=""
 ARG TARGETARCH
 
 ENV PROJECT_DIR=/project
-ENV PATH=/home/${USERNAME}/.cargo/bin:/home/${USERNAME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV SPACK_ROOT=/opt/spack
+ENV PATH=${SPACK_ROOT}/bin:/home/${USERNAME}/.cargo/bin:/home/${USERNAME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Base tooling + repos + Docker CLI
 RUN set -eux; \
@@ -22,7 +23,7 @@ RUN set -eux; \
     dnf -y swap --allowerasing curl-minimal curl; \
     \
     dnf -y install \
-    bash git openssh-clients openssh-server procps-ng util-linux wget \
+    bash git openssh-clients openssh-server procps-ng util-linux wget iputils \
     sudo zsh tmux \
     gcc gcc-c++ make pkgconf-pkg-config libatomic \
     python3 python3-pip \
@@ -77,6 +78,12 @@ RUN set -eux; \
     echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USERNAME}"; \
     chmod 0440 "/etc/sudoers.d/${USERNAME}"
 
+# Spack package manager
+RUN set -eux; \
+    git clone --depth=1 https://github.com/spack/spack.git "${SPACK_ROOT}"; \
+    "${SPACK_ROOT}/bin/spack" --version; \
+    chown -R "${USERNAME}:${USER_GID}" "${SPACK_ROOT}"
+
 # Agent CLIs
 RUN npm install -g --no-fund --no-audit \
     @openai/codex \
@@ -89,6 +96,8 @@ RUN mkdir -p "${PROJECT_DIR}" && chown -R "${USER_UID}:${USER_GID}" "${PROJECT_D
 
 USER "${USERNAME}"
 
+# MUST happen after switching user
+RUN echo '. "${SPACK_ROOT}/share/spack/setup-env.sh"' >> ~/.bashrc
 # MUST happen after switching user
 RUN curl -fsSL https://claude.ai/install.sh | bash
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
