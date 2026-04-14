@@ -84,6 +84,9 @@ RUN set -eux; \
     "${SPACK_ROOT}/bin/spack" --version; \
     chown -R "${USERNAME}:${USER_GID}" "${SPACK_ROOT}"
 
+# Mise
+RUN curl https://mise.run | sh
+
 # Agent CLIs
 RUN npm install -g --no-fund --no-audit \
     @openai/codex \
