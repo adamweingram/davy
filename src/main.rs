@@ -404,6 +404,14 @@ fn build_runtime_settings(args: RunArgs) -> Result<RuntimeSettings> {
     )? {
         eprintln!("davy: warning: continuing without host skills mount.");
     }
+    add_file_bind_mount(
+        &mut extra_docker_args,
+        &home.join(".config/git/.gitignore"),
+        "/home/dev/.config/git/ignore",
+        "global gitignore",
+        true,
+        true,
+    )?;
 
     let docker_sock = if args.with_docker_sock {
         Some(resolve_docker_socket_path(args.docker_sock)?)
@@ -772,6 +780,31 @@ fn add_bind_mount(
             "davy: warning: {label} mount source not found at {}; skipping.",
             source.display()
         );
+        return Ok(false);
+    }
+
+    bail!("{label} mount source not found: {}", source.display());
+}
+
+fn add_file_bind_mount(
+    args: &mut Vec<OsString>,
+    source: &Path,
+    target: &str,
+    label: &str,
+    read_only: bool,
+    allow_missing: bool,
+) -> Result<bool> {
+    if source.is_file() {
+        let suffix = if read_only { ":ro" } else { "" };
+        push_volume(args, format!("{}:{target}{suffix}", source.display()));
+        return Ok(true);
+    }
+
+    if source.exists() {
+        bail!("{label} mount source is not a file: {}", source.display());
+    }
+
+    if allow_missing {
         return Ok(false);
     }
 
