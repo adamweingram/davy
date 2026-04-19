@@ -406,9 +406,17 @@ fn build_runtime_settings(args: RunArgs) -> Result<RuntimeSettings> {
     }
     add_file_bind_mount(
         &mut extra_docker_args,
-        &home.join(".config/git/.gitignore"),
+        &home.join(".config/git/ignore"),
         "/home/dev/.config/git/ignore",
         "global gitignore",
+        true,
+        true,
+    )?;
+    add_file_bind_mount(
+        &mut extra_docker_args,
+        &home.join(".gitconfig"),
+        "/home/dev/.gitconfig",
+        "global gitconfig",
         true,
         true,
     )?;
